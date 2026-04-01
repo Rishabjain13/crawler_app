@@ -15,6 +15,7 @@ export interface UrlRecord {
   parentUrl?:  string;
   title?:      string;
   description?:string;
+  excerpt?:    string;  // first 500 chars of extracted text content
   statusCode?: number;
   linksFound?: number;
   fetchedAt?:  string;
@@ -27,6 +28,7 @@ export interface CrawlJobConfig {
   maxDepth:       number;
   maxUrls:        number;
   allowedDomains: string; // comma-separated, blank = seed hostname
+  query?:         string; // original search query (set by /api/search)
 }
 
 export interface CrawlJobState {

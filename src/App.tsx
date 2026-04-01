@@ -4,15 +4,16 @@ import ResultCard  from './components/ResultCard';
 import SkeletonCard from './components/SkeletonCard';
 import StatsBar    from './components/StatsBar';
 import EmptyState  from './components/EmptyState';
-import type { CrawlJob, CrawlResult, CrawlStats, CrawlStatus } from './types';
+import type { SearchQuery, CrawlResult, CrawlStats, CrawlStatus } from './types';
 
 export default function App() {
   const [status,   setStatus]   = useState<CrawlStatus>('idle');
   const [results,  setResults]  = useState<CrawlResult[]>([]);
   const [stats,    setStats]    = useState<CrawlStats | null>(null);
+  const [summary,  setSummary]  = useState<string>('');
   const [errorMsg, setErrorMsg] = useState('');
   const [filter,   setFilter]   = useState('');
-  // Hold a ref to the active EventSource so we can cancel it
+  const [phase,    setPhase]    = useState<'searching' | 'crawling'>('searching');
   const esRef = useRef<EventSource | null>(null);
 
   function cancelCrawl() {
@@ -21,7 +22,7 @@ export default function App() {
     setStatus('idle');
   }
 
-  async function handleCrawl(job: CrawlJob) {
+  async function handleSearch(job: SearchQuery) {
     // Tear down any in-flight crawl
     esRef.current?.close();
     esRef.current = null;
@@ -29,15 +30,17 @@ export default function App() {
     setStatus('loading');
     setResults([]);
     setStats(null);
+    setSummary('');
     setErrorMsg('');
     setFilter('');
+    setPhase('searching');
 
-    // ── 1. Start the job (POST /api/crawl) ──────────────────────────────────
+    // ── 1. Discover seed URLs via SearXNG (POST /api/search) ────────────────
     let jobId: string;
     try {
       const controller = new AbortController();
-      const tid = setTimeout(() => controller.abort(), 10_000);
-      const res = await fetch('/api/crawl', {
+      const tid = setTimeout(() => controller.abort(), 15_000);
+      const res = await fetch('/api/search', {
         method:  'POST',
         headers: { 'Content-Type': 'application/json' },
         body:    JSON.stringify(job),
@@ -49,10 +52,12 @@ export default function App() {
         const payload = await res.json().catch(() => ({ error: `HTTP ${res.status}` }));
         throw new Error((payload as { error?: string }).error ?? `HTTP ${res.status}`);
       }
-      jobId = ((await res.json()) as { jobId: string }).jobId;
+      const data = (await res.json()) as { jobId: string; seedUrls?: string[] };
+      jobId = data.jobId;
+      setPhase('crawling');
     } catch (err) {
-      const msg = err instanceof Error ? err.message : 'Failed to start crawl';
-      setErrorMsg(msg.slice(0, 200));
+      const msg = err instanceof Error ? err.message : 'Failed to start search';
+      setErrorMsg(msg.slice(0, 300));
       setStatus('error');
       return;
     }
@@ -70,10 +75,14 @@ export default function App() {
 
     es.addEventListener('done', (e: MessageEvent) => {
       try {
-        const payload = JSON.parse(e.data) as { results: CrawlResult[]; stats: CrawlStats };
-        // Replace accumulated records with the synthesized final list (correct order)
+        const payload = JSON.parse(e.data) as {
+          results: CrawlResult[];
+          stats:   CrawlStats;
+          summary?: string;
+        };
         setResults(payload.results);
         setStats(payload.stats);
+        if (payload.summary) setSummary(payload.summary);
       } catch { /* keep accumulated results */ }
       setStatus('success');
       es.close();
@@ -83,7 +92,7 @@ export default function App() {
     es.addEventListener('crawl_error', (e: MessageEvent) => {
       try {
         const payload = JSON.parse(e.data) as { error?: string };
-        setErrorMsg((payload.error ?? 'Crawl failed').slice(0, 200));
+        setErrorMsg((payload.error ?? 'Crawl failed').slice(0, 300));
       } catch {
         setErrorMsg('Crawl failed');
       }
@@ -92,7 +101,6 @@ export default function App() {
       esRef.current = null;
     });
 
-    // Native connection-level error (network drop, server restart, etc.)
     es.onerror = () => {
       if (status !== 'success') {
         setErrorMsg('Connection lost — the server may have restarted');
@@ -129,13 +137,13 @@ export default function App() {
             <h1 className="text-xl font-bold tracking-tight">WebCrawler</h1>
           </div>
           <p className="text-sm text-gray-500 dark:text-gray-400 ml-9">
-            Crawlee + Playwright · Redis frontier · PostgreSQL state machine
+            SearXNG · Playwright · Open-source search pipeline
           </p>
         </header>
 
         {/* Search */}
         <div className="bg-white dark:bg-gray-900 border border-gray-200 dark:border-gray-800 rounded-2xl p-5 mb-6 shadow-sm">
-          <SearchBar onSubmit={handleCrawl} onCancel={cancelCrawl} status={status} />
+          <SearchBar onSubmit={handleSearch} onCancel={cancelCrawl} status={status} />
         </div>
 
         {/* States */}
@@ -147,12 +155,13 @@ export default function App() {
         {showSkeleton && (
           <div className="space-y-3">
             <div className="flex items-center gap-2 text-sm text-violet-600 dark:text-violet-400 mb-4">
-              <svg className="w-4 h-4 animate-spin" fill="none" viewBox="0 0 24 24">
-                <circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4" />
-                <path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4z" />
-              </svg>
-              <span className="font-medium">Crawling pages…</span>
-              <span className="text-gray-400 dark:text-gray-500 text-xs">routing through frontier</span>
+              <Spinner />
+              <span className="font-medium">
+                {phase === 'searching' ? 'Querying SearXNG…' : 'Crawling pages…'}
+              </span>
+              <span className="text-gray-400 dark:text-gray-500 text-xs">
+                {phase === 'searching' ? 'discovering seed URLs' : 'routing through frontier'}
+              </span>
             </div>
             {Array.from({ length: 6 }).map((_, i) => <SkeletonCard key={i} index={i} />)}
           </div>
@@ -164,15 +173,29 @@ export default function App() {
             {/* In-progress counter */}
             {isLoading && (
               <div className="flex items-center gap-2 text-sm text-violet-600 dark:text-violet-400 mb-4">
-                <svg className="w-4 h-4 animate-spin" fill="none" viewBox="0 0 24 24">
-                  <circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4" />
-                  <path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4z" />
-                </svg>
-                <span className="font-medium">Crawling… {results.length} page{results.length !== 1 ? 's' : ''} so far</span>
+                <Spinner />
+                <span className="font-medium">
+                  Crawling… {results.length} page{results.length !== 1 ? 's' : ''} so far
+                </span>
               </div>
             )}
 
             {stats && <StatsBar stats={stats} resultCount={filtered.length} />}
+
+            {/* Research summary */}
+            {summary && (
+              <details className="mb-4 bg-violet-50 dark:bg-violet-950/30 border border-violet-200 dark:border-violet-800 rounded-xl overflow-hidden" open>
+                <summary className="px-4 py-3 cursor-pointer text-sm font-medium text-violet-700 dark:text-violet-300 select-none flex items-center gap-2">
+                  <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                    <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M9 12h6m-6 4h6m2 5H7a2 2 0 01-2-2V5a2 2 0 012-2h5.586a1 1 0 01.707.293l5.414 5.414a1 1 0 01.293.707V19a2 2 0 01-2 2z" />
+                  </svg>
+                  Research Summary
+                </summary>
+                <pre className="px-4 pb-4 text-xs text-gray-700 dark:text-gray-300 whitespace-pre-wrap font-sans leading-relaxed">
+                  {summary}
+                </pre>
+              </details>
+            )}
 
             {/* Filter */}
             <div className="relative mb-4">
@@ -213,5 +236,14 @@ export default function App() {
         )}
       </div>
     </div>
+  );
+}
+
+function Spinner() {
+  return (
+    <svg className="w-4 h-4 animate-spin" fill="none" viewBox="0 0 24 24">
+      <circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4" />
+      <path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4z" />
+    </svg>
   );
 }

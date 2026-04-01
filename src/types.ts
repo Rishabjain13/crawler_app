@@ -10,6 +10,15 @@ export interface CrawlJob {
   allowedDomains: string; // comma-separated input string
 }
 
+/** Payload sent to POST /api/search */
+export interface SearchQuery {
+  query:          string;
+  searxngUrl:     string;
+  maxDepth:       number;
+  maxUrls:        number;
+  allowedDomains: string;
+}
+
 export interface CrawlResult {
   id: string;
   url: string;

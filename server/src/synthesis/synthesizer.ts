@@ -49,3 +49,79 @@ export function synthesize(
 
   return { results, stats };
 }
+
+/**
+ * Generate a plain-text research summary from crawled records.
+ *
+ * No LLM required — this is extractive synthesis:
+ *   1. Score each DONE record by how many query terms appear in
+ *      title + description + excerpt.
+ *   2. Present the top results with their key snippet.
+ *   3. Append aggregate stats.
+ */
+export function buildSummary(
+  records:   UrlRecord[],
+  query:     string,
+  startTime: number,
+): string {
+  const done = records.filter(r => r.state === 'DONE');
+  const durationSec = ((Date.now() - startTime) / 1_000).toFixed(1);
+
+  if (done.length === 0) {
+    return `No pages could be successfully crawled for "${query}". `
+      + `${records.filter(r => r.state === 'FAILED' || r.state === 'DEAD').length} URLs were unreachable or blocked.`;
+  }
+
+  // Tokenise query into lowercase terms (skip very short words)
+  const terms = query
+    .toLowerCase()
+    .split(/\W+/)
+    .filter(t => t.length > 2);
+
+  // Score each record
+  function scoreRecord(r: UrlRecord): number {
+    const haystack = [r.title, r.description, r.excerpt].join(' ').toLowerCase();
+    return terms.reduce((acc, t) => acc + (haystack.includes(t) ? 1 : 0), 0);
+  }
+
+  const scored = done
+    .map(r => ({ record: r, score: scoreRecord(r) }))
+    .sort((a, b) => b.score - a.score || (b.record.depth - a.record.depth) * -1);
+
+  const topN  = scored.slice(0, 8);
+  const matchCount = scored.filter(s => s.score > 0).length;
+
+  const lines: string[] = [];
+  lines.push(`Research summary for: "${query}"`);
+  lines.push('');
+  lines.push(
+    `Crawled ${done.length} page${done.length !== 1 ? 's' : ''} in ${durationSec}s. `
+    + `Query terms found in ${matchCount} of ${done.length} pages.`,
+  );
+  lines.push('');
+
+  if (topN.length > 0) {
+    lines.push('Key findings:');
+    lines.push('');
+    for (const { record: r } of topN) {
+      const host  = (() => { try { return new URL(r.url).hostname; } catch { return r.url; } })();
+      const title = r.title?.trim() || '(no title)';
+      lines.push(`• ${title} (${host})`);
+
+      const snippet = r.description?.trim() || r.excerpt?.trim() || '';
+      if (snippet) {
+        // Wrap to ~120 chars per line
+        const capped = snippet.length > 200 ? snippet.slice(0, 197) + '…' : snippet;
+        lines.push(`  ${capped}`);
+      }
+      lines.push('');
+    }
+  }
+
+  const failed = records.filter(r => r.state === 'FAILED' || r.state === 'DEAD');
+  if (failed.length > 0) {
+    lines.push(`${failed.length} URL${failed.length !== 1 ? 's' : ''} were unreachable or blocked.`);
+  }
+
+  return lines.join('\n').trimEnd();
+}

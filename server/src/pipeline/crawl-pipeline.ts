@@ -154,6 +154,7 @@ export async function runCrawlPipeline(
       record.renderMode  = renderMode;
       record.title       = content.title;
       record.description = content.description;
+      record.excerpt     = content.textContent.slice(0, 500);
       record.linksFound  = content.outgoingLinks.length;
       record.fetchedAt   = new Date().toLocaleTimeString();
       jobStore.saveRecord(jobId, record);

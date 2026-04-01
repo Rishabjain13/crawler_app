@@ -1,12 +1,13 @@
 import type { Request, Response } from 'express';
 import { jobStore }            from '../storage/job-store.js';
 import { runCrawlPipeline }    from '../pipeline/crawl-pipeline.js';
-import { synthesize }          from '../synthesis/synthesizer.js';
+import { synthesize, buildSummary } from '../synthesis/synthesizer.js';
 import { isPrivateUrl }        from '../crawler/url-normalizer.js';
+import { searchSearXNG }       from '../search/searxng-client.js';
 import { logger }              from '../logger.js';
 import type { CrawlJobConfig, UrlRecord, CrawlJobState } from '../types.js';
 
-// ── Input validation ──────────────────────────────────────────────────────────
+// ── Helpers ───────────────────────────────────────────────────────────────────
 
 function validateConfig(body: unknown): { config: CrawlJobConfig } | { error: string } {
   const b = body as Partial<CrawlJobConfig>;
@@ -29,7 +30,6 @@ function validateConfig(body: unknown): { config: CrawlJobConfig } | { error: st
     } catch {
       return { error: `Invalid seed URL: ${url}` };
     }
-    // SSRF guard — also enforced at fetch time, but reject early
     if (isPrivateUrl(url)) {
       return { error: `Seed URL resolves to a private/reserved address: ${url}` };
     }
@@ -44,8 +44,24 @@ function validateConfig(body: unknown): { config: CrawlJobConfig } | { error: st
       maxDepth:       Math.min(Math.max(Number.isFinite(rawDepth) ? rawDepth : 2, 1), 5),
       maxUrls:        Math.min(Math.max(Number.isFinite(rawUrls)  ? rawUrls  : 20, 1), 50),
       allowedDomains: typeof b.allowedDomains === 'string' ? b.allowedDomains : '',
+      query:          typeof b.query === 'string' ? b.query : undefined,
     },
   };
+}
+
+/** Fire-and-forget wrapper used by both /api/crawl and /api/search. */
+function startPipeline(jobId: string, config: CrawlJobConfig): void {
+  (async () => {
+    try {
+      await runCrawlPipeline(jobId, config);
+    } catch (err) {
+      jobStore.updateJob(jobId, { status: 'failed' });
+      logger.error(
+        { jobId, err: err instanceof Error ? err.message : String(err) },
+        'pipeline error',
+      );
+    }
+  })();
 }
 
 // ── Handlers ──────────────────────────────────────────────────────────────────
@@ -55,9 +71,6 @@ function validateConfig(body: unknown): { config: CrawlJobConfig } | { error: st
  *
  * Validates input, creates a job, starts the pipeline in the background,
  * and immediately returns 202 + { jobId }.
- *
- * The pipeline no longer blocks the HTTP handler — every other request
- * (including health checks and SSE streams) remains responsive.
  */
 export async function handleStartCrawl(req: Request, res: Response): Promise<void> {
   const result = validateConfig(req.body);
@@ -69,21 +82,98 @@ export async function handleStartCrawl(req: Request, res: Response): Promise<voi
   const { config } = result;
   const job = jobStore.createJob(config);
   logger.info({ jobId: job.id, config }, 'crawl job queued');
-
-  // Fire-and-forget — pipeline runs entirely in the background
-  (async () => {
-    try {
-      await runCrawlPipeline(job.id, config);
-    } catch (err) {
-      jobStore.updateJob(job.id, { status: 'failed' });
-      logger.error(
-        { jobId: job.id, err: err instanceof Error ? err.message : String(err) },
-        'pipeline error',
-      );
-    }
-  })();
-
+  startPipeline(job.id, config);
   res.status(202).json({ jobId: job.id });
+}
+
+/**
+ * POST /api/search
+ *
+ * Accepts { query, searxngUrl?, maxDepth?, maxUrls?, allowedDomains? }.
+ * Calls SearXNG to discover seed URLs, then starts a crawl job exactly like
+ * /api/crawl.  Returns 202 + { jobId, seedUrls }.
+ *
+ * Error cases handled:
+ *   - SearXNG unreachable → 503
+ *   - No results found    → 422
+ *   - Private searxngUrl  → 400 (SSRF guard)
+ */
+export async function handleSearchQuery(req: Request, res: Response): Promise<void> {
+  const body = req.body as {
+    query?:          unknown;
+    searxngUrl?:     unknown;
+    maxDepth?:       unknown;
+    maxUrls?:        unknown;
+    allowedDomains?: unknown;
+  };
+
+  // ── Validate query ────────────────────────────────────────────────────────
+  if (!body.query || typeof body.query !== 'string' || !body.query.trim()) {
+    res.status(400).json({ error: 'query must be a non-empty string' });
+    return;
+  }
+  const query = body.query.trim().slice(0, 500);
+
+  // ── Validate searxngUrl ───────────────────────────────────────────────────
+  const rawSearxng = typeof body.searxngUrl === 'string'
+    ? body.searxngUrl.trim()
+    : (process.env.SEARXNG_URL ?? 'http://localhost:8080');
+
+  let searxngUrl: string;
+  try {
+    const parsed = new URL(rawSearxng);
+    if (parsed.protocol !== 'http:' && parsed.protocol !== 'https:') {
+      res.status(400).json({ error: 'searxngUrl must use http or https' });
+      return;
+    }
+    searxngUrl = parsed.origin; // strip any path/query from base URL
+  } catch {
+    res.status(400).json({ error: `Invalid searxngUrl: ${rawSearxng}` });
+    return;
+  }
+
+  // ── Call SearXNG ──────────────────────────────────────────────────────────
+  // Note: no SSRF guard here — SearXNG is a configured backend service that
+  // legitimately runs on localhost. SSRF protection applies to crawl targets.
+  let searxResults;
+  try {
+    searxResults = await searchSearXNG(query, searxngUrl, 10);
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err);
+    res.status(503).json({
+      error: `Could not reach SearXNG at ${searxngUrl}. `
+        + `Make sure it is running and JSON format is enabled. Details: ${msg}`,
+    });
+    return;
+  }
+
+  if (searxResults.length === 0) {
+    res.status(422).json({
+      error: `SearXNG returned no results for "${query}". Try a different query or check your SearXNG instance.`,
+    });
+    return;
+  }
+
+  const seedUrls = searxResults.map(r => r.url);
+  logger.info({ query, seedUrls }, 'seed URLs from SearXNG');
+
+  // ── Build config & start job ───────────────────────────────────────────────
+  const rawDepth = Number(body.maxDepth);
+  const rawUrls  = Number(body.maxUrls);
+
+  const config: CrawlJobConfig = {
+    seedUrls,
+    maxDepth:       Math.min(Math.max(Number.isFinite(rawDepth) ? rawDepth : 1, 1), 5),
+    maxUrls:        Math.min(Math.max(Number.isFinite(rawUrls)  ? rawUrls  : 20, 1), 50),
+    allowedDomains: typeof body.allowedDomains === 'string' ? body.allowedDomains : '',
+    query,
+  };
+
+  const job = jobStore.createJob(config);
+  logger.info({ jobId: job.id, query, seedCount: seedUrls.length }, 'search job queued');
+  startPipeline(job.id, config);
+
+  res.status(202).json({ jobId: job.id, seedUrls });
 }
 
 /**
@@ -92,46 +182,68 @@ export async function handleStartCrawl(req: Request, res: Response): Promise<voi
  * Returns current job status + all accumulated results (for polling clients
  * or post-job retrieval).
  */
+const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+
 export function handleGetJob(req: Request, res: Response): void {
-  const { jobId } = req.params;
+  const jobId = String(req.params.jobId);
+  if (!UUID_RE.test(jobId)) {
+    res.status(400).json({ error: 'Invalid jobId format' });
+    return;
+  }
   const job = jobStore.getJob(jobId);
   if (!job) {
     res.status(404).json({ error: 'Job not found' });
     return;
   }
 
-  const records        = jobStore.getRecords(jobId);
-  const { results, stats } = synthesize(records, job.startedAt);
-  res.json({ jobId, status: job.status, results, stats });
+  const records             = jobStore.getRecords(jobId);
+  const { results, stats }  = synthesize(records, job.startedAt);
+  const summary             = job.config.query
+    ? buildSummary(records, job.config.query, job.startedAt)
+    : undefined;
+
+  res.json({ jobId, status: job.status, results, stats, summary });
 }
 
 /**
  * GET /api/jobs/:jobId/stream
  *
  * Server-Sent Events stream.  The client receives:
- *   event: record   — one per crawled URL (UrlRecord JSON)
- *   event: done     — when the crawl finishes successfully ({ results, stats })
- *   event: crawl_error — on pipeline failure ({ error })
+ *   event: record       — one per crawled URL (UrlRecord JSON)
+ *   event: done         — when the crawl finishes ({ results, stats, summary? })
+ *   event: crawl_error  — on pipeline failure ({ error })
  *
  * If the job is already finished when this endpoint is hit (e.g. reconnect),
  * all records are flushed synchronously and the stream is closed.
  */
 export function handleStreamJob(req: Request, res: Response): void {
-  const { jobId } = req.params;
+  const jobId = String(req.params.jobId);
+  if (!UUID_RE.test(jobId)) {
+    res.status(400).json({ error: 'Invalid jobId format' });
+    return;
+  }
   const job = jobStore.getJob(jobId);
   if (!job) {
     res.status(404).json({ error: 'Job not found' });
     return;
   }
 
-  res.setHeader('Content-Type',  'text/event-stream');
-  res.setHeader('Cache-Control', 'no-cache');
-  res.setHeader('Connection',    'keep-alive');
-  res.setHeader('X-Accel-Buffering', 'no'); // disable nginx proxy buffering
+  res.setHeader('Content-Type',      'text/event-stream');
+  res.setHeader('Cache-Control',     'no-cache');
+  res.setHeader('Connection',        'keep-alive');
+  res.setHeader('X-Accel-Buffering', 'no');
   res.flushHeaders();
 
   function send(event: string, data: unknown): void {
     res.write(`event: ${event}\ndata: ${JSON.stringify(data)}\n\n`);
+  }
+
+  function buildDonePayload(records: UrlRecord[], startedAt: number) {
+    const { results, stats } = synthesize(records, startedAt);
+    const summary = job!.config.query
+      ? buildSummary(records, job!.config.query, startedAt)
+      : undefined;
+    return { results, stats, summary };
   }
 
   // ── Already-finished job: flush all records synchronously ─────────────────
@@ -140,8 +252,7 @@ export function handleStreamJob(req: Request, res: Response): void {
     for (const r of records) send('record', r);
 
     if (job.status === 'done') {
-      const { results, stats } = synthesize(records, job.startedAt);
-      send('done', { results, stats });
+      send('done', buildDonePayload(records, job.startedAt));
     } else {
       send('crawl_error', { error: 'Crawl pipeline failed' });
     }
@@ -155,8 +266,7 @@ export function handleStreamJob(req: Request, res: Response): void {
   const onJob = (updated: CrawlJobState) => {
     const records = jobStore.getRecords(jobId);
     if (updated.status === 'done') {
-      const { results, stats } = synthesize(records, updated.startedAt);
-      send('done', { results, stats });
+      send('done', buildDonePayload(records, updated.startedAt));
     } else {
       send('crawl_error', { error: 'Crawl pipeline failed' });
     }
@@ -172,6 +282,5 @@ export function handleStreamJob(req: Request, res: Response): void {
   jobStore.on(`record:${jobId}`, onRecord);
   jobStore.on(`job:${jobId}`,    onJob);
 
-  // Clean up listeners when the client disconnects
   req.on('close', cleanup);
 }
