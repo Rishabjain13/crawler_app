@@ -1,62 +1,281 @@
 # WebCrawler
 
-A self-hosted research tool that takes a natural language query, discovers seed URLs via **SearXNG**, crawls those pages (with full **Playwright** support for JavaScript-rendered content), extracts text, and synthesizes a ranked summary — no Google Search API, no OpenAI, no external AI services.
+A full-stack research tool that takes a natural language query, discovers seed URLs via **SearXNG**, crawls those pages with automatic JS escalation via **Playwright**, extracts content, and streams live results to the UI — no Google Search API, no OpenAI, no external AI services.
 
 ---
 
-## How it works
+## Tech Stack
+
+### Frontend
+| Tech | Purpose |
+|---|---|
+| React 19 | UI framework |
+| TypeScript | Type safety |
+| Vite | Dev server + bundler |
+| Tailwind CSS | Styling |
+| `EventSource` (browser API) | SSE streaming from backend |
+
+### Backend
+| Tech | Purpose |
+|---|---|
+| Node.js + TypeScript | Runtime |
+| Express | HTTP server + routing |
+| axios | Static HTTP fetching (plain HTML pages) |
+| Playwright (optional) | Headless Chromium for JS-rendered SPAs |
+| Cheerio | Fast HTML parsing — titles, links, meta tags, JSON-LD |
+| jsdom | Full DOM simulation required by Readability |
+| @mozilla/readability | Article text extraction (Firefox Reader View algorithm) |
+| robots-parser | robots.txt compliance |
+| pino | Structured JSON logging |
+| Node `EventEmitter` | SSE bridge between crawl pipeline and HTTP stream |
+
+### Search
+| Tech | Purpose |
+|---|---|
+| SearXNG | Self-hosted meta-search engine — converts query into seed URLs |
+
+---
+
+## Full Flow
 
 ```
-User query
-  └─ POST /api/search
-      └─ SearXNG  →  up to 10 seed URLs
-          └─ Crawl frontier (BFS, depth-limited)
-              ├─ Static fetch (axios)       — fast HTML pages
-              └─ Playwright escalation      — JS-rendered SPAs
-                  └─ extractContent()       — title, description, text, links
-                      └─ buildSummary()     — extractive ranked summary
-                          └─ SSE stream → frontend
+User types query in SearchBar
+        │
+        ▼
+POST /api/search
+  { query, searxngUrl, maxDepth, maxUrls, allowedDomains }
+        │
+        ▼
+searchSearXNG()
+  → GET searxng/search?q=...&format=json
+  → deduplicate by URL
+  → return up to 10 seed URLs
+        │
+        ▼
+jobStore.createJob(config)  →  jobId (UUID)
+        │
+        ▼
+startPipeline()  ← fire-and-forget, 202 returned to frontend immediately
+        │
+        ▼
+Frontend opens EventSource on /api/jobs/:jobId/stream
+        │
+        ▼
+runCrawlPipeline(jobId, config)
+  │
+  ├── normalizeUrl(seedUrl)
+  │     - upgrades http → https
+  │     - lowercases hostname
+  │     - strips #fragment
+  │     - sorts query params
+  │     - SSRF guard (blocks 127.x, 10.x, 172.16-31.x, 192.168.x, 169.254.x)
+  │     - returns null for private/invalid URLs → skip
+  │
+  ├── frontier.push({ url, depth: 0, priority: Date.now() })
+  │     - InMemoryFrontier backed by binary min-heap (O log n push/pop)
+  │     - SHA-256 seen-set for O(1) dedup
+  │
+  └── MAIN LOOP: while frontier has URLs and crawledCount < maxUrls
+        │
+        ├── frontier.pop()  →  entry { url, depth, parentUrl }
+        │
+        ├── record created: state=FETCHING, renderMode='static'
+        │   jobStore.saveRecord() → emits "record:<jobId>" → SSE sends to browser
+        │
+        ├── getRobotsRules(url)   ← cached 24h per hostname
+        │   isAllowed(url, rules) → if blocked: state=DEAD, skip
+        │
+        ├── waitForToken(hostname, crawlDelay)
+        │     - token bucket rate limiter (one bucket per hostname)
+        │     - respects robots.txt Crawl-delay (min 500ms)
+        │     - exponential backoff + jitter on retries
+        │
+        ├── fetchStatic(url)   ← Phase 1 — always runs
+        │     - axios GET, arraybuffer response type
+        │     - persistent keep-alive connection pool (maxSockets: 10)
+        │     - round-robin User-Agent rotation (3 real Chrome strings)
+        │     - follows up to 5 redirects
+        │     - 5 MB content-length cap
+        │     - charset detection from Content-Type header (UTF-8 / ISO-8859-1 / latin1)
+        │     - returns { html, statusCode, finalUrl }
+        │
+        ├── empty response → state=DEAD
+        │
+        ├── detectRenderMode(html)   ← heuristic, 4 signals in priority order
+        │     1. Empty SPA mount point (#root/#app/#__next/#__nuxt) with <100 chars
+        │     2. Hashed JS bundle <script src> (main.abc123.js) + body text <300 chars
+        │     3. Inline framework boot signals (__NEXT_DATA__, ReactDOM.render,
+        │        createRoot, new Vue, angular.bootstrap, etc.)
+        │     4. Sparse body: HTML >5KB but visible text <200 chars
+        │     → returns 'static' or 'js'
+        │
+        ├── if 'js':  fetchWithPlaywright(url)   ← Phase 2 — optional escalation
+        │     - singleton headless Chromium (lazy launch, reused across all URLs)
+        │     - semaphore: max 3 concurrent tabs (pageWaiters queue for excess)
+        │     - page.goto(url, { waitUntil: 'networkidle', timeout: 30s })
+        │       networkidle = no network requests for 500ms (SPA API calls settle)
+        │     - page.content() → fully rendered DOM as HTML string
+        │     - finally: releasePage() + page.close() (always, even on error)
+        │     - returns null if Playwright not installed → fallback to static html
+        │
+        ├── statusCode ≥ 400 → state=DEAD (4xx) or FAILED (5xx, retryable)
+        │
+        ├── extractContent(html, finalUrl)
+        │     CHEERIO (fast path, no DOM):
+        │       - title: og:title → <title> tag
+        │       - description: og:description → meta[name=description]
+        │       - metaTags: all meta[name] and meta[property] key-value pairs
+        │       - outgoingLinks: all <a href>, resolved via new URL(href, finalUrl)
+        │         (handles relative, absolute, protocol-relative; skips mailto/js)
+        │       - schemaOrgData: all <script type="application/ld+json"> parsed as JSON
+        │     JSDOM + READABILITY (article text):
+        │       - jsdom builds full DOM from HTML (browser-equivalent environment)
+        │       - Readability scores every block by text density, link ratio,
+        │         class names — strips nav/footer/ads/sidebars, returns main content
+        │       - textContent.replace(/\s+/g, ' ').trim()
+        │       - fallback: $('body').text() if jsdom/Readability throws
+        │
+        ├── record updated:
+        │     state=DONE, renderMode='static'|'js',
+        │     title, description, excerpt (first 500 chars of textContent),
+        │     linksFound, fetchedAt, statusCode
+        │   jobStore.saveRecord() → emits "record:<jobId>" → SSE sends DONE record
+        │
+        ├── link discovery (only if depth < maxDepth):
+        │     for each outgoingLink:
+        │       normalizeUrl(link, finalUrl) → null? skip
+        │       hostname in allowedDomains?  → no? skip
+        │       frontier.push({ url, depth: depth+1,
+        │                        priority: Date.now() + depth*1000 })
+        │         (deeper pages get lower priority = crawled later)
+        │
+        └── on error (network/timeout):
+              retryCount < 3 → state=FAILED, requeue with 5s*retryCount delay
+              retryCount ≥ 3 → state=DEAD, applyBackoff(hostname)
+
+        │
+        ▼
+jobStore.updateJob({ status: 'done' })
+  → emits "job:<jobId>" → SSE handler fires
+
+        │
+        ▼
+SSE 'done' event:
+  synthesize(records)
+    - sort by depth asc, then fetchedAt asc (BFS order)
+    - map UrlRecord → CrawlResult (public API shape)
+    - stats: totalPages, totalLinks, staticPages, jsPages, failedUrls, deadUrls, duration
+
+  buildSummary(records, query)   ← only for /api/search jobs
+    - filter to DONE records only
+    - tokenize query: lowercase, split on \W+, drop terms ≤2 chars
+    - score each record: count query terms found in title+description+excerpt
+    - sort: highest score first, tiebreak by lower depth first
+    - take top 8
+    - format: plain text with bullet per result (title, hostname, snippet ≤200 chars)
+    - append failed/dead URL count
+
+        │
+        ▼
+Frontend receives 'done':
+  - setResults(payload.results) — replaces accumulated live records with final sorted list
+  - setStats(payload.stats)     — StatsBar renders totals + render mode breakdown
+  - setSummary(payload.summary) — collapsible Research Summary panel
+  - ResultCard per result:
+      - blue "Static" badge or amber "JS ⚡" badge (renderMode)
+      - colored HTTP status badge (green 200, blue 301/302, red 404, orange 500)
+      - colored state badge (DONE/FAILED/DEAD/FETCHING)
+      - depth, links found, retry count, parent URL path, crawledAt time
 ```
+
+---
+
+## URL State Machine
+
+Every URL goes through a forward-only state machine (never moves backwards):
+
+```
+DISCOVERED → QUEUED → FETCHING → DONE
+                              → FAILED  (retryable, requeued)
+                              → DEAD    (blocked by robots / 4xx / max retries)
+```
+
+`jobStore.saveRecord()` enforces the order — a record in state DONE cannot be overwritten with FETCHING even if a race occurs.
+
+---
+
+## SSE Architecture
+
+```
+runCrawlPipeline()
+    │  jobStore.saveRecord()  →  emits "record:<jobId>"
+    │  jobStore.updateJob()   →  emits "job:<jobId>"
+    │
+JobStore extends EventEmitter
+    │
+    │  .on("record:<jobId>", onRecord)
+    │  .on("job:<jobId>",    onJob)
+    │
+handleStreamJob()
+    │  res.write(`event: record\ndata: {...}\n\n`)
+    │  res.write(`event: done\ndata: {...}\n\n`)  →  res.end()
+    │
+    │  cleanup() on: job done, crawl_error, req.on('close') (client disconnect)
+    │
+EventSource (browser)
+    │  .addEventListener('record', ...)
+    │  .addEventListener('done', ...)
+    │  .addEventListener('crawl_error', ...)
+```
+
+Jobs are cleaned up from memory after 1 hour via `setTimeout` in `jobStore.updateJob`.
 
 ---
 
 ## Prerequisites
 
 | Tool | Version | Notes |
-|------|---------|-------|
+|---|---|---|
 | Node.js | 18+ | Required |
 | Docker | any | For SearXNG |
-| Playwright Chromium | auto-installed | `npx playwright install chromium` |
+| Playwright Chromium | optional | Only for JS-rendered pages |
 
 ---
 
-## Local setup
+## Running locally
 
 ### 1. Clone and install
 
-```powershell
+```bash
 git clone <repo-url>
 cd crawler_app
 
-# Frontend deps
+# Frontend
 npm install
 
-# Backend deps
+# Backend
 cd server
 npm install
-npx playwright install chromium
-cd ..
 ```
 
-### 2. Start SearXNG
+### 2. Install Playwright browsers (optional)
 
-```powershell
+Only needed for JS-heavy pages (SPAs). The crawler works without it — JS pages fall back to the static result.
+
+```bash
+cd server
+npx playwright install chromium
+```
+
+### 3. Start SearXNG
+
+```bash
 docker run -d -p 8888:8080 --name searxng searxng/searxng
 ```
 
-Enable JSON format (required once after first run):
+Enable JSON format (required once):
 
-```powershell
+```bash
 docker exec searxng python3 -c "
 txt = open('/etc/searxng/settings.yml').read()
 txt = txt.replace('  formats:\n    - html', '  formats:\n    - html\n    - json')
@@ -65,50 +284,57 @@ open('/etc/searxng/settings.yml', 'w').write(txt)
 docker restart searxng
 ```
 
-Verify it works:
+Verify:
 
-```powershell
+```bash
 curl "http://localhost:8888/search?q=test&format=json"
 ```
 
-### 3. Start the backend
+### 4. Start the backend
 
-```powershell
+```bash
 cd server
-$env:PORT=3001; npm run dev
-```
-
-### 4. Start the frontend
-
-```powershell
-# in a second terminal, from crawler_app/
 npm run dev
+# Listening on http://localhost:3001
 ```
 
-Open **http://localhost:5173** (or 5174 if 5173 is taken).
+### 5. Start the frontend
+
+```bash
+# from crawler_app/ root, separate terminal
+npm run dev
+# http://localhost:5173
+```
+
+Open **http://localhost:5173**, enter your SearXNG URL as `http://localhost:8888`, type a query, and search.
 
 ---
 
 ## Environment variables
 
-All optional — defaults work for local development.
-
 | Variable | Default | Description |
-|----------|---------|-------------|
-| `PORT` | `3001` | Backend server port |
-| `SEARXNG_URL` | `http://localhost:8080` | SearXNG base URL (overrides frontend input) |
-| `ALLOWED_ORIGINS` | `http://localhost:5173,http://localhost:5174` | CORS allowlist (comma-separated) |
+|---|---|---|
+| `PORT` | `3001` | Backend port |
+| `ALLOWED_ORIGINS` | `http://localhost:5173,http://localhost:5174` | CORS allowlist |
+| `SEARXNG_URL` | `http://localhost:8080` | Server-side fallback if `searxngUrl` not sent in request body |
 
 ---
 
 ## API Reference
 
+### `GET /api/health`
+
+```json
+{ "ok": true, "ts": "2024-01-01T00:00:00.000Z" }
+```
+
+---
+
 ### `POST /api/search`
 
-Accepts a natural language query, queries SearXNG for seed URLs, and starts a crawl job.
+Query → SearXNG → seed URLs → crawl job.
 
-**Request**
-
+**Request body**
 ```json
 {
   "query":          "best open-source LLMs 2024",
@@ -119,39 +345,33 @@ Accepts a natural language query, queries SearXNG for seed URLs, and starts a cr
 }
 ```
 
-| Field | Type | Required | Default | Constraints |
-|-------|------|----------|---------|-------------|
-| `query` | string | yes | — | max 500 chars |
-| `searxngUrl` | string | no | env `SEARXNG_URL` or `localhost:8080` | valid http/https URL |
-| `maxDepth` | number | no | `1` | clamped to [1, 5] |
-| `maxUrls` | number | no | `20` | clamped to [1, 50] |
-| `allowedDomains` | string | no | `""` | comma-separated hostnames; blank = all |
+| Field | Type | Required | Constraints |
+|---|---|---|---|
+| `query` | string | yes | max 500 chars |
+| `searxngUrl` | string | no | defaults to `SEARXNG_URL` env var |
+| `maxDepth` | number | no | clamped to [1, 5], default 1 |
+| `maxUrls` | number | no | clamped to [1, 50], default 20 |
+| `allowedDomains` | string | no | comma-separated hostnames; blank = all |
 
 **Response `202 Accepted`**
-
 ```json
-{
-  "jobId":    "550e8400-e29b-41d4-a716-446655440000",
-  "seedUrls": ["https://example.com", "https://other.com"]
-}
+{ "jobId": "uuid", "seedUrls": ["https://..."] }
 ```
 
-**Error responses**
-
-| Status | Reason |
-|--------|--------|
-| `400` | `query` is missing or empty |
-| `422` | SearXNG returned zero results |
-| `503` | SearXNG instance unreachable |
+| Error | Status |
+|---|---|
+| Missing/empty query | 400 |
+| Invalid or private `searxngUrl` | 400 |
+| SearXNG returned no results | 422 |
+| SearXNG unreachable | 503 |
 
 ---
 
 ### `POST /api/crawl`
 
-Start a crawl from explicit seed URLs (no SearXNG step).
+Start a crawl from explicit seed URLs (no SearXNG step). No `summary` is generated.
 
-**Request**
-
+**Request body**
 ```json
 {
   "seedUrls":       ["https://example.com"],
@@ -162,88 +382,87 @@ Start a crawl from explicit seed URLs (no SearXNG step).
 ```
 
 | Field | Type | Required | Constraints |
-|-------|------|----------|-------------|
+|---|---|---|---|
 | `seedUrls` | string[] | yes | 1–10 URLs, http/https only, no private IPs |
-| `maxDepth` | number | no | clamped to [1, 5] |
-| `maxUrls` | number | no | clamped to [1, 50] |
+| `maxDepth` | number | no | clamped to [1, 5], default 2 |
+| `maxUrls` | number | no | clamped to [1, 50], default 20 |
 | `allowedDomains` | string | no | comma-separated; blank = seed hostnames only |
 
 **Response `202 Accepted`**
-
 ```json
-{ "jobId": "550e8400-e29b-41d4-a716-446655440000" }
+{ "jobId": "uuid" }
 ```
 
 ---
 
 ### `GET /api/jobs/:jobId`
 
-Poll job status and get all accumulated results.
+Poll job status and all results.
 
 **Response `200 OK`**
-
 ```json
 {
-  "jobId":   "550e8400-e29b-41d4-a716-446655440000",
-  "status":  "running",
+  "jobId":   "uuid",
+  "status":  "running | done | failed",
   "results": [
     {
       "id":          "uuid",
       "url":         "https://example.com",
       "title":       "Example Domain",
-      "description": "This domain is for use in examples.",
+      "description": "This domain is for illustrative examples.",
       "statusCode":  200,
       "depth":       0,
       "linksFound":  3,
-      "crawledAt":   "12:34:56",
-      "state":       "DONE",
-      "renderMode":  "static",
+      "crawledAt":   "12:34:56 PM",
+      "state":       "DONE | FAILED | DEAD | FETCHING",
+      "renderMode":  "static | js",
       "retryCount":  0,
-      "parentUrl":   null
+      "parentUrl":   "https://..."
     }
   ],
   "stats": {
-    "totalPages":  1,
-    "totalLinks":  3,
-    "staticPages": 1,
-    "jsPages":     0,
+    "totalPages":  10,
+    "totalLinks":  87,
+    "staticPages": 8,
+    "jsPages":     2,
     "failedUrls":  0,
-    "deadUrls":    0,
-    "duration":    1243
+    "deadUrls":    1,
+    "duration":    14200
   },
-  "summary": "Research summary for: \"example query\"\n\nFound 1 page..."
+  "summary": "Research summary for: \"query\"\n\nCrawled 8 pages..."
 }
 ```
 
-**Error responses**
+`summary` only present for jobs started via `/api/search`.
 
-| Status | Reason |
-|--------|--------|
-| `400` | `jobId` is not a valid UUID |
-| `404` | Job not found |
+| Error | Status |
+|---|---|
+| `jobId` not a valid UUID | 400 |
+| Job not found | 404 |
 
 ---
 
 ### `GET /api/jobs/:jobId/stream`
 
-Server-Sent Events (SSE) stream for live results as pages are crawled.
+SSE stream. Connect with `EventSource` for live results.
 
 **Events**
 
-| Event name | Payload | When |
-|------------|---------|------|
-| `record` | `UrlRecord` (single page result) | After each URL completes |
-| `done` | `{ results, stats, summary }` | When crawl finishes |
-| `crawl_error` | `{ error: string }` | On pipeline failure |
+| Event | Payload | When |
+|---|---|---|
+| `record` | Full `UrlRecord` (same shape as `results[]` above) | After each URL completes (including FAILED/DEAD) |
+| `done` | `{ results, stats, summary? }` | Crawl finished |
+| `crawl_error` | `{ error: string }` | Pipeline crashed |
 
-**Example (JavaScript)**
+If you connect after the job is already done, all records are flushed synchronously and the connection closes immediately.
 
+**Example**
 ```js
 const es = new EventSource(`/api/jobs/${jobId}/stream`);
 
 es.addEventListener('record', e => {
   const page = JSON.parse(e.data);
-  console.log(page.url, page.state);
+  console.log(page.url, page.state, page.renderMode);
 });
 
 es.addEventListener('done', e => {
@@ -260,68 +479,55 @@ es.addEventListener('crawl_error', e => {
 
 ---
 
-### `GET /api/health`
+## Project structure
 
-Liveness probe.
-
-```json
-{ "ok": true, "ts": "2024-01-01T00:00:00.000Z" }
+```
+crawler_app/
+├── src/                            # React frontend
+│   ├── App.tsx                     # Root — SSE wiring, state, layout
+│   ├── types.ts                    # CrawlResult, CrawlStats, RenderMode, UrlState
+│   └── components/
+│       ├── SearchBar.tsx           # Query input, depth selector, advanced options
+│       ├── ResultCard.tsx          # Per-URL card — badges, title, description, meta
+│       ├── StatsBar.tsx            # Totals + static/js breakdown + escalation %
+│       ├── SkeletonCard.tsx        # Loading placeholder while waiting for first result
+│       └── EmptyState.tsx          # idle / error / no-results states
+│
+└── server/
+    └── src/
+        ├── index.ts                # Express app, CORS, routes, graceful shutdown
+        ├── types.ts                # UrlRecord, CrawlJobConfig, CrawlResult, CrawlStats
+        ├── logger.ts               # pino logger
+        ├── api/
+        │   └── crawl-handler.ts    # Route handlers + SSE stream handler
+        ├── search/
+        │   └── searxng-client.ts   # SearXNG HTTP client — query, dedup, return URLs
+        ├── crawler/
+        │   ├── static-crawler.ts   # axios fetch — keep-alive pool, charset decode, UA rotation
+        │   ├── js-crawler.ts       # Playwright — singleton Chromium, semaphore, networkidle
+        │   ├── render-detector.ts  # Heuristic — 4 signals to detect SPA vs static
+        │   └── url-normalizer.ts   # Canonical URL + SSRF guard (RFC-1918 + loopback)
+        ├── parsers/
+        │   ├── content-extractor.ts  # Cheerio (meta/links/JSON-LD) + Readability (article text)
+        │   └── robots-cache.ts       # robots.txt fetch, parse, 24h cache per hostname
+        ├── middleware/
+        │   └── rate-limiter.ts       # Token bucket per domain, exponential backoff + jitter
+        ├── frontier/
+        │   └── frontier.ts           # Binary min-heap priority queue + SHA-256 seen-set
+        ├── pipeline/
+        │   └── crawl-pipeline.ts     # Main orchestration loop — all phases in sequence
+        ├── storage/
+        │   └── job-store.ts          # In-memory Map + EventEmitter, forward-only state machine
+        └── synthesis/
+            └── synthesizer.ts        # CrawlResult mapper, CrawlStats, extractive summary
 ```
 
 ---
 
 ## Definition of Done
 
-- [x] Type a search query → get results from crawled pages
-- [x] JS-heavy pages handled via Playwright (auto-detected, auto-escalated)
-- [x] All APIs documented with request/response schemas
-- [x] README explains how to run locally
-
-## Technical requirements
-
-- [x] JavaScript-rendered pages via Playwright (headless Chromium)
-- [x] No Google Search API, no OpenAI API
-- [x] SearXNG as self-hosted search entry point for seed URLs
-- [x] Crawl → extract page content → synthesize response
-- [x] Graceful error handling: timeouts, blocked pages, empty results
-
----
-
-## Project structure
-
-```
-crawler_app/
-├── src/                        # React frontend (Vite + TailwindCSS)
-│   ├── App.tsx                 # SSE streaming, state management
-│   ├── components/
-│   │   ├── SearchBar.tsx       # Query input + SearXNG URL config
-│   │   ├── ResultCard.tsx      # Per-URL result card
-│   │   ├── StatsBar.tsx        # Aggregate stats display
-│   │   └── EmptyState.tsx      # Idle / error / no-results states
-│   └── types.ts
-│
-└── server/                     # Express backend (Node.js + TypeScript)
-    └── src/
-        ├── index.ts            # Express app, CORS, routes
-        ├── api/
-        │   └── crawl-handler.ts   # POST /api/search, /api/crawl, GET /api/jobs
-        ├── search/
-        │   └── searxng-client.ts  # SearXNG HTTP client
-        ├── crawler/
-        │   ├── static-crawler.ts  # axios HTTP fetch
-        │   ├── js-crawler.ts      # Playwright headless browser
-        │   └── render-detector.ts # Heuristic JS vs static detection
-        ├── parsers/
-        │   ├── content-extractor.ts  # Cheerio + Readability
-        │   └── robots-cache.ts       # robots.txt fetch + 24h cache
-        ├── middleware/
-        │   └── rate-limiter.ts    # Token bucket per domain
-        ├── frontier/
-        │   └── frontier.ts        # In-memory min-heap priority queue
-        ├── pipeline/
-        │   └── crawl-pipeline.ts  # Main orchestration loop
-        ├── storage/
-        │   └── job-store.ts       # In-memory job state + EventEmitter
-        └── synthesis/
-            └── synthesizer.ts     # Extractive summary (no LLM)
-```
+- [x] I can type a search query and get results from crawled pages
+- [x] JS-heavy pages are handled correctly (auto-detected, auto-escalated to headless Chromium)
+- [x] APIs are documented (all endpoints, request/response shapes, error codes)
+- [x] Code has been reviewed before submission
+- [x] A short README explains how to run the project locally
